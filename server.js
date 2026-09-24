@@ -4,136 +4,124 @@ const { execFile } = require("child_process")
 
 const app = express()
 
-const PORT = process.env.PORT || 9100
-const HOST = "0.0.0.0"
+// =====================================================
+// CONFIG
+// =====================================================
 
-app.use(cors())
+const PORT = 9100
+const HOST = "127.0.0.1"
+
+const RENDER_API =
+  process.env.RENDER_API ||
+  "https://printing-service-a55f.onrender.com"
+
+const PRINT_API_KEY =
+  process.env.PRINT_API_KEY ||
+  "ELKJ_PRINT_2026_SECRET"
+
+// Poll every 2 seconds
+const POLL_INTERVAL = 2000
+
+// =====================================================
+// MIDDLEWARE
+// =====================================================
 
 app.use(
-  express.json({
-    limit: "2mb",
+  cors({
+    origin: "*",
   })
 )
 
+app.use(express.json({ limit: "2mb" }))
 
-// ============================================================
-// GET DEFAULT WINDOWS PRINTER
-// ============================================================
+// =====================================================
+// POWERSELL HELPER
+// =====================================================
 
-function getDefaultPrinter() {
-  return new Promise(
-    (resolve, reject) => {
-      const powershellScript = `
-Get-CimInstance Win32_Printer |
-Where-Object { $_.Default -eq $true } |
-Select-Object Name, PrinterStatus, Default, WorkOffline, PrinterState |
-ConvertTo-Json -Compress
-`
-
-      execFile(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-Command",
-          powershellScript,
-        ],
-        {
-          windowsHide: true,
-          encoding: "utf8",
-        },
-        (
-          error,
-          stdout,
-          stderr
-        ) => {
-          if (error) {
-            console.error(
-              "Printer detection error:",
-              stderr ||
+function runPowerShell(script) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+      ],
+      {
+        windowsHide: true,
+        maxBuffer: 10 * 1024 * 1024,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              stderr?.trim() ||
+                stdout?.trim() ||
                 error.message
             )
+          )
 
-            reject(
-              new Error(
-                stderr?.trim() ||
-                  error.message ||
-                  "Failed to detect printer."
-              )
-            )
-
-            return
-          }
-
-          try {
-            if (
-              !stdout.trim()
-            ) {
-              resolve(null)
-              return
-            }
-
-            const printer =
-              JSON.parse(
-                stdout.trim()
-              )
-
-            resolve(
-              printer
-            )
-          } catch (error) {
-            console.error(
-              "Printer JSON parse error:",
-              error
-            )
-
-            reject(error)
-          }
+          return
         }
-      )
-    }
-  )
+
+        resolve(stdout.trim())
+      }
+    )
+  })
 }
 
+// =====================================================
+// GET DEFAULT PRINTER
+// =====================================================
 
-// ============================================================
-// RAW PRINT
-// ============================================================
+async function getDefaultPrinter() {
+  const script = `
+    Get-CimInstance Win32_Printer |
+    Where-Object { $_.Default -eq $true } |
+    Select-Object Name, PrinterStatus, Default, WorkOffline, PrinterState |
+    ConvertTo-Json -Compress
+  `
 
-function rawPrint(
-  printerName,
-  receiptText
-) {
-  return new Promise(
-    (
-      resolve,
-      reject
-    ) => {
-      const base64Text =
-        Buffer.from(
-          receiptText,
-          "ascii"
-        ).toString(
-          "base64"
-        )
+  const output = await runPowerShell(script)
 
-      const safePrinterName =
-        String(
-          printerName
-        )
-          .replace(
-            /\\/g,
-            "\\\\"
-          )
-          .replace(
-            /"/g,
-            '\\"'
-          )
+  if (!output) {
+    return null
+  }
 
-      const powershellScript = `
-$ErrorActionPreference = "Stop"
+  let printer
+
+  try {
+    printer = JSON.parse(output)
+  } catch {
+    throw new Error("Unable to parse printer information.")
+  }
+
+  if (Array.isArray(printer)) {
+    printer = printer[0]
+  }
+
+  return printer || null
+}
+
+// =====================================================
+// RAW PRINTER
+// =====================================================
+
+async function rawPrint(printerName, receiptText) {
+  const base64 = Buffer.from(receiptText, "ascii").toString(
+    "base64"
+  )
+
+  const escapedPrinterName = printerName.replace(/'/g, "''")
+
+  const script = `
+$printerName = '${escapedPrinterName}'
+
+$base64 = '${base64}'
+
+$bytes = [System.Convert]::FromBase64String($base64)
 
 Add-Type @"
 using System;
@@ -141,10 +129,7 @@ using System.Runtime.InteropServices;
 
 public class RawPrinter
 {
-    [StructLayout(
-        LayoutKind.Sequential,
-        CharSet = CharSet.Unicode
-    )]
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public class DOCINFO
     {
         [MarshalAs(UnmanagedType.LPWStr)]
@@ -157,64 +142,41 @@ public class RawPrinter
         public string pDataType;
     }
 
-    [DllImport(
-        "winspool.drv",
-        SetLastError = true,
-        CharSet = CharSet.Unicode
-    )]
+    [DllImport("winspool.drv", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern bool OpenPrinter(
         string pPrinterName,
         out IntPtr phPrinter,
         IntPtr pDefault
     );
 
-    [DllImport(
-        "winspool.drv",
-        SetLastError = true
-    )]
+    [DllImport("winspool.drv", SetLastError = true)]
     public static extern bool ClosePrinter(
         IntPtr hPrinter
     );
 
-    [DllImport(
-        "winspool.drv",
-        SetLastError = true,
-        CharSet = CharSet.Unicode
-    )]
-    public static extern int StartDocPrinter(
+    [DllImport("winspool.drv", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool StartDocPrinter(
         IntPtr hPrinter,
         int level,
-        [In] DOCINFO di
+        DOCINFO pDocInfo
     );
 
-    [DllImport(
-        "winspool.drv",
-        SetLastError = true
-    )]
+    [DllImport("winspool.drv", SetLastError = true)]
     public static extern bool EndDocPrinter(
         IntPtr hPrinter
     );
 
-    [DllImport(
-        "winspool.drv",
-        SetLastError = true
-    )]
-    public static extern int StartPagePrinter(
+    [DllImport("winspool.drv", SetLastError = true)]
+    public static extern bool StartPagePrinter(
         IntPtr hPrinter
     );
 
-    [DllImport(
-        "winspool.drv",
-        SetLastError = true
-    )]
+    [DllImport("winspool.drv", SetLastError = true)]
     public static extern bool EndPagePrinter(
         IntPtr hPrinter
     );
 
-    [DllImport(
-        "winspool.drv",
-        SetLastError = true
-    )]
+    [DllImport("winspool.drv", SetLastError = true)]
     public static extern bool WritePrinter(
         IntPtr hPrinter,
         IntPtr pBytes,
@@ -227,104 +189,56 @@ public class RawPrinter
         byte[] bytes
     )
     {
-        IntPtr hPrinter =
-            IntPtr.Zero;
+        IntPtr hPrinter;
 
-        // ----------------------------------------------------
-        // OPEN PRINTER
-        // ----------------------------------------------------
-
-        if (
-            !OpenPrinter(
-                printerName,
-                out hPrinter,
-                IntPtr.Zero
-            )
-        )
+        if (!OpenPrinter(
+            printerName,
+            out hPrinter,
+            IntPtr.Zero
+        ))
         {
             throw new Exception(
-                "OpenPrinter failed. Win32 Error: " +
+                "OpenPrinter failed. Error: " +
                 Marshal.GetLastWin32Error()
             );
         }
 
         try
         {
-            // ------------------------------------------------
-            // DOCUMENT INFO
-            // ------------------------------------------------
+            DOCINFO docInfo = new DOCINFO();
 
-            DOCINFO docInfo =
-                new DOCINFO();
+            docInfo.pDocName = "ELKJ POS Receipt";
+            docInfo.pDataType = "RAW";
 
-            docInfo.pDocName =
-                "ELKJ POS Receipt";
-
-            docInfo.pOutputFile =
-                null;
-
-            docInfo.pDataType =
-                "RAW";
-
-            // ------------------------------------------------
-            // START DOCUMENT
-            // ------------------------------------------------
-
-            int jobId =
-                StartDocPrinter(
-                    hPrinter,
-                    1,
-                    docInfo
-                );
-
-            if (
-                jobId == 0
-            )
+            if (!StartDocPrinter(
+                hPrinter,
+                1,
+                docInfo
+            ))
             {
                 throw new Exception(
-                    "StartDocPrinter failed. Win32 Error: " +
+                    "StartDocPrinter failed. Error: " +
                     Marshal.GetLastWin32Error()
                 );
             }
 
             try
             {
-                // --------------------------------------------
-                // START PAGE
-                // --------------------------------------------
-
-                int pageStarted =
-                    StartPagePrinter(
-                        hPrinter
-                    );
-
-                if (
-                    pageStarted == 0
-                )
+                if (!StartPagePrinter(hPrinter))
                 {
                     throw new Exception(
-                        "StartPagePrinter failed. Win32 Error: " +
+                        "StartPagePrinter failed. Error: " +
                         Marshal.GetLastWin32Error()
                     );
                 }
 
                 try
                 {
-                    // ----------------------------------------
-                    // ALLOCATE MEMORY
-                    // ----------------------------------------
-
                     IntPtr unmanagedPointer =
-                        Marshal.AllocHGlobal(
-                            bytes.Length
-                        );
+                        Marshal.AllocHGlobal(bytes.Length);
 
                     try
                     {
-                        // ------------------------------------
-                        // COPY BYTES
-                        // ------------------------------------
-
                         Marshal.Copy(
                             bytes,
                             0,
@@ -332,49 +246,29 @@ public class RawPrinter
                             bytes.Length
                         );
 
-                        // ------------------------------------
-                        // WRITE PRINTER
-                        // ------------------------------------
+                        int written;
 
-                        int written = 0;
-
-                        bool success =
-                            WritePrinter(
-                                hPrinter,
-                                unmanagedPointer,
-                                bytes.Length,
-                                out written
-                            );
-
-                        if (
-                            !success
-                        )
+                        if (!WritePrinter(
+                            hPrinter,
+                            unmanagedPointer,
+                            bytes.Length,
+                            out written
+                        ))
                         {
                             throw new Exception(
-                                "WritePrinter failed. Win32 Error: " +
+                                "WritePrinter failed. Error: " +
                                 Marshal.GetLastWin32Error()
                             );
                         }
 
-                        // ------------------------------------
-                        // VERIFY
-                        // ------------------------------------
-                        // IMPORTANT:
-                        // C# uses !=
-                        // NOT !==
-                        // ------------------------------------
-
-                        if (
-                            written !=
-                            bytes.Length
-                        )
+                        if (written != bytes.Length)
                         {
                             throw new Exception(
-                                "Printer only received " +
+                                "Only " +
                                 written +
                                 " of " +
-                                bytes.Length +
-                                " bytes."
+                                bytes.length +
+                                " bytes were written."
                             );
                         }
                     }
@@ -387,1044 +281,725 @@ public class RawPrinter
                 }
                 finally
                 {
-                    EndPagePrinter(
-                        hPrinter
-                    );
+                    EndPagePrinter(hPrinter);
                 }
             }
             finally
             {
-                EndDocPrinter(
-                    hPrinter
-                );
+                EndDocPrinter(hPrinter);
             }
         }
         finally
         {
-            ClosePrinter(
-                hPrinter
-            );
+            ClosePrinter(hPrinter);
         }
     }
 }
 "@
 
-$base64 = "${base64Text}"
-
-$bytes =
-    [Convert]::FromBase64String(
-        $base64
-    )
-
 [RawPrinter]::SendBytes(
-    "${safePrinterName}",
+    $printerName,
     $bytes
 )
 
-Write-Output "RAW_PRINT_SUCCESS"
+Write-Output "PRINT_SUCCESS"
 `
 
-      console.log("")
-      console.log(
-        "======================================"
-      )
-      console.log(
-        "RAW ESC/POS PRINT"
-      )
-      console.log(
-        "======================================"
-      )
-      console.log(
-        "Printer:",
-        printerName
-      )
-      console.log(
-        "Bytes:",
-        Buffer.from(
-          receiptText,
-          "ascii"
-        ).length
-      )
-      console.log(
-        "======================================"
-      )
+  const output = await runPowerShell(script)
 
-      execFile(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-Command",
-          powershellScript,
-        ],
-        {
-          windowsHide: true,
-          encoding: "utf8",
-          maxBuffer:
-            1024 * 1024,
-        },
-        (
-          error,
-          stdout,
-          stderr
-        ) => {
-          console.log("")
-          console.log(
-            "PowerShell stdout:"
-          )
-
-          console.log(
-            stdout ||
-              "(empty)"
-          )
-
-          console.log("")
-          console.log(
-            "PowerShell stderr:"
-          )
-
-          console.log(
-            stderr ||
-              "(empty)"
-          )
-
-          if (error) {
-            console.error("")
-            console.error(
-              "RAW PRINT ERROR:"
-            )
-
-            console.error(
-              error
-            )
-
-            reject(
-              new Error(
-                stderr?.trim() ||
-                  error.message ||
-                  "Failed to send RAW print job."
-              )
-            )
-
-            return
-          }
-
-          resolve({
-            stdout,
-            stderr,
-          })
-        }
-      )
-    }
-  )
-}
-
-
-// ============================================================
-// MONEY
-// ============================================================
-
-function formatMoney(
-  value
-) {
-  return Number(
-    value ?? 0
-  ).toFixed(2)
-}
-
-
-// ============================================================
-// PAD RIGHT
-// ============================================================
-
-function padRight(
-  text,
-  length
-) {
-  text = String(
-    text ?? ""
-  )
-
-  if (
-    text.length >=
-    length
-  ) {
-    return text.substring(
-      0,
-      length
+  if (!output.includes("PRINT_SUCCESS")) {
+    throw new Error(
+      output || "Unknown printer error."
     )
   }
 
-  return (
-    text +
-    " ".repeat(
-      length -
-        text.length
-    )
-  )
+  return true
 }
 
+// =====================================================
+// RECEIPT HELPERS
+// =====================================================
 
-// ============================================================
-// PAD LEFT
-// ============================================================
+function line(char = "-", length = 32) {
+  return char.repeat(length)
+}
 
-function padLeft(
-  text,
-  length
-) {
-  text = String(
-    text ?? ""
-  )
+function padRight(text, length) {
+  text = String(text ?? "")
 
-  if (
-    text.length >=
-    length
-  ) {
-    return text.substring(
-      0,
-      length
-    )
+  if (text.length >= length) {
+    return text.substring(0, length)
+  }
+
+  return text + " ".repeat(length - text.length)
+}
+
+function padLeft(text, length) {
+  text = String(text ?? "")
+
+  if (text.length >= length) {
+    return text.substring(0, length)
+  }
+
+  return " ".repeat(length - text.length) + text
+}
+
+function money(value) {
+  const number = Number(value || 0)
+
+  return number.toLocaleString("en-PH", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
+}
+
+function twoColumns(left, right, width = 32) {
+  const rightText = String(right)
+
+  const leftWidth = width - rightText.length - 1
+
+  if (leftWidth <= 0) {
+    return rightText.substring(0, width)
   }
 
   return (
-    " ".repeat(
-      length -
-        text.length
-    ) +
-    text
-  )
-}
-
-
-// ============================================================
-// FORMAT ITEM
-// ============================================================
-
-function formatItem(
-  name,
-  qty,
-  price
-) {
-  const width = 32
-
-  const quantity =
-    Number(qty ?? 0)
-
-  const unitPrice =
-    Number(price ?? 0)
-
-  const total =
-    quantity *
-    unitPrice
-
-  const right =
-    `${quantity} x ${formatMoney(
-      unitPrice
-    )} ${formatMoney(
-      total
-    )}`
-
-  const available =
-    width -
-    right.length -
-    1
-
-  const productName =
-    String(
-      name ?? "Item"
-    ).substring(
-      0,
-      Math.max(
-        available,
-        1
-      )
-    )
-
-  return (
-    padRight(
-      productName,
-      Math.max(
-        available,
-        1
-      )
-    ) +
+    padRight(left, leftWidth) +
     " " +
-    right
+    padLeft(rightText, rightText.length)
   )
 }
 
-
-// ============================================================
+// =====================================================
 // CREATE SALE RECEIPT
-// ============================================================
+// =====================================================
 
-function createSaleReceipt(
-  sale
-) {
-  const ESC =
-    "\x1B"
-
-  const GS =
-    "\x1D"
-
-  const center =
-    ESC +
-    "a" +
-    "\x01"
-
-  const left =
-    ESC +
-    "a" +
-    "\x00"
-
-  const boldOn =
-    ESC +
-    "E" +
-    "\x01"
-
-  const boldOff =
-    ESC +
-    "E" +
-    "\x00"
+function createSaleReceipt(sale) {
+  const WIDTH = 32
 
   let receipt = ""
 
-  // ==========================================================
-  // INIT
-  // ==========================================================
-
-  receipt +=
-    ESC + "@"
-
-  // ==========================================================
+  // ===================================================
   // HEADER
-  // ==========================================================
+  // ===================================================
 
-  receipt +=
-    center
+  receipt += "\x1B\x40"
 
-  receipt +=
-    boldOn
+  receipt += "\x1B\x61\x01"
+  receipt += "\x1B\x45\x01"
 
-  receipt +=
-    "ELKJ IT SOLUTIONS\n"
+  receipt += "ELKJ IT SOLUTIONS\n"
 
-  receipt +=
-    boldOff
+  receipt += "\x1B\x45\x00"
 
-  receipt +=
-    "POINT OF SALE\n"
+  receipt += "POINT OF SALE SYSTEM\n"
 
-  receipt +=
-    "--------------------------------\n"
+  receipt += "\x1B\x61\x00"
 
-  // ==========================================================
+  receipt += line("=", WIDTH) + "\n"
+
+  // ===================================================
   // SALE INFO
-  // ==========================================================
+  // ===================================================
 
-  receipt +=
-    left
+  receipt += `Invoice: ${sale.invoice_number || sale.invoice || "-"}\n`
 
-  const invoice =
-    sale?.invoice ??
-    sale?.invoice_number ??
-    "-"
+  if (sale.customer_name) {
+    receipt += `Customer: ${sale.customer_name}\n`
+  }
 
-  const customer =
-    sale?.customer_name ??
-    "Walk-in Customer"
+  if (sale.customer_contact) {
+    receipt += `Contact: ${sale.customer_contact}\n`
+  }
 
-  let saleDate = ""
+  if (sale.created_at) {
+    const date = new Date(sale.created_at)
 
-  if (
-    sale?.created_at
-  ) {
-    const parsedDate =
-      new Date(
-        sale.created_at
-      )
-
-    if (
-      !Number.isNaN(
-        parsedDate.getTime()
-      )
-    ) {
-      saleDate =
-        parsedDate.toLocaleString()
+    if (!Number.isNaN(date.getTime())) {
+      receipt += `Date: ${date.toLocaleString("en-PH")}\n`
     }
   }
 
-  if (!saleDate) {
-    saleDate =
-      new Date().toLocaleString()
-  }
+  receipt += line("-", WIDTH) + "\n"
 
-  receipt +=
-    `Invoice: ${invoice}\n`
-
-  receipt +=
-    `Customer: ${customer}\n`
-
-  receipt +=
-    `Date: ${saleDate}\n`
-
-  receipt +=
-    "--------------------------------\n"
-
-  // ==========================================================
+  // ===================================================
   // ITEMS
-  // ==========================================================
+  // ===================================================
 
   const items =
-    Array.isArray(
-      sale?.sale_items
-    )
-      ? sale.sale_items
-      : Array.isArray(
-          sale?.items
+    sale.items ||
+    sale.sale_items ||
+    sale.saleItems ||
+    []
+
+  for (const item of items) {
+    const productName =
+      item.product_name ||
+      item.name ||
+      item.product?.name ||
+      "Product"
+
+    const quantity =
+      Number(
+        item.quantity ||
+          item.qty ||
+          0
+      )
+
+    const price =
+      Number(
+        item.unit_price ||
+          item.price ||
+          item.product?.selling_price ||
+          0
+      )
+
+    const total =
+      Number(
+        item.total ||
+          item.subtotal ||
+          quantity * price
+      )
+
+    receipt += `${productName}\n`
+
+    receipt +=
+      `${quantity} x ${money(price)}` +
+      padLeft(
+        money(total),
+        Math.max(
+          1,
+          WIDTH -
+            (`${quantity} x ${money(price)}`).length
         )
-        ? sale.items
-        : []
-
-  receipt +=
-    "ITEMS\n"
-
-  receipt +=
-    "--------------------------------\n"
-
-  if (
-    items.length > 0
-  ) {
-    items.forEach(
-      (item) => {
-        const product =
-          item?.product ??
-          {}
-
-        const name =
-          item?.product_name ??
-          product?.name ??
-          item?.name ??
-          "Product"
-
-        const quantity =
-          item?.quantity ??
-          0
-
-        const unitPrice =
-          item?.unit_price ??
-          item?.price ??
-          0
-
-        receipt +=
-          formatItem(
-            name,
-            quantity,
-            unitPrice
-          ) +
-          "\n"
-      }
-    )
-  } else {
-    receipt +=
-      "No item details available\n"
+      ) +
+      "\n"
   }
 
-  receipt +=
-    "--------------------------------\n"
+  receipt += line("-", WIDTH) + "\n"
 
-  // ==========================================================
-  // AMOUNTS
-  // ==========================================================
+  // ===================================================
+  // TOTALS
+  // ===================================================
 
-  const subtotal =
-    Number(
-      sale?.subtotal ??
-        0
-    )
+  const subtotal = Number(
+    sale.subtotal ||
+      sale.sub_total ||
+      0
+  )
 
-  const discount =
-    Number(
-      sale?.discount ??
-        0
-    )
+  const discount = Number(
+    sale.discount ||
+      0
+  )
 
-  const tax =
-    Number(
-      sale?.tax ??
-        0
-    )
+  const tax = Number(
+    sale.tax ||
+      0
+  )
 
-  const total =
-    Number(
-      sale?.total_amount ??
-        sale?.total ??
-        0
-    )
+  const total = Number(
+    sale.total ||
+      sale.total_amount ||
+      0
+  )
 
-  const amountPaid =
-    Number(
-      sale?.amount_paid ??
-        0
-    )
+  receipt += twoColumns(
+    "Subtotal",
+    money(subtotal),
+    WIDTH
+  ) + "\n"
 
-  const change =
-    Number(
-      sale?.change_amount ??
-        0
-    )
-
-  const paymentMethod =
-    sale?.payment_method ??
-    "Cash"
-
-  receipt +=
-    `Subtotal: ${padLeft(
-      formatMoney(
-        subtotal
-      ),
-      20
-    )}\n`
-
-  receipt +=
-    `Discount: ${padLeft(
-      formatMoney(
-        discount
-      ),
-      20
-    )}\n`
-
-  receipt +=
-    `Tax: ${padLeft(
-      formatMoney(
-        tax
-      ),
-      20
-    )}\n`
-
-  receipt +=
-    "--------------------------------\n"
-
-  receipt +=
-    boldOn
-
-  receipt +=
-    `TOTAL: ${padLeft(
-      formatMoney(
-        total
-      ),
-      19
-    )}\n`
-
-  receipt +=
-    boldOff
-
-  receipt +=
-    "--------------------------------\n"
-
-  receipt +=
-    `Payment: ${paymentMethod}\n`
-
-  receipt +=
-    `Paid: ${padLeft(
-      formatMoney(
-        amountPaid
-      ),
-      20
-    )}\n`
-
-  receipt +=
-    `Change: ${padLeft(
-      formatMoney(
-        change
-      ),
-      18
-    )}\n`
-
-  // ==========================================================
-  // PROVIDER
-  // ==========================================================
-
-  if (
-    sale?.provider
-  ) {
-    receipt +=
-      `Provider: ${sale.provider}\n`
+  if (discount > 0) {
+    receipt += twoColumns(
+      "Discount",
+      `-${money(discount)}`,
+      WIDTH
+    ) + "\n"
   }
 
-  // ==========================================================
-  // REFERENCE
-  // ==========================================================
-
-  if (
-    sale?.reference_number
-  ) {
-    receipt +=
-      `Reference: ${sale.reference_number}\n`
+  if (tax > 0) {
+    receipt += twoColumns(
+      "Tax",
+      money(tax),
+      WIDTH
+    ) + "\n"
   }
 
-  // ==========================================================
+  receipt += line("-", WIDTH) + "\n"
+
+  receipt += "\x1B\x45\x01"
+
+  receipt += twoColumns(
+    "TOTAL",
+    money(total),
+    WIDTH
+  ) + "\n"
+
+  receipt += "\x1B\x45\x00"
+
+  receipt += line("-", WIDTH) + "\n"
+
+  // ===================================================
+  // PAYMENT
+  // ===================================================
+
+  if (sale.payment_method) {
+    receipt += `Payment: ${sale.payment_method}\n`
+  }
+
+  if (sale.payment_provider) {
+    receipt += `Provider: ${sale.payment_provider}\n`
+  }
+
+  if (sale.provider) {
+    receipt += `Provider: ${sale.provider}\n`
+  }
+
+  if (sale.reference) {
+    receipt += `Reference: ${sale.reference}\n`
+  }
+
+  if (sale.reference_number) {
+    receipt += `Reference: ${sale.reference_number}\n`
+  }
+
+  const amountPaid = Number(
+    sale.amount_paid ||
+      sale.paid_amount ||
+      0
+  )
+
+  if (amountPaid > 0) {
+    receipt += twoColumns(
+      "Amount Paid",
+      money(amountPaid),
+      WIDTH
+    ) + "\n"
+  }
+
+  const change = Number(
+    sale.change ||
+      sale.change_amount ||
+      0
+  )
+
+  if (change > 0) {
+    receipt += twoColumns(
+      "Change",
+      money(change),
+      WIDTH
+    ) + "\n"
+  }
+
+  // ===================================================
   // INSTALLMENT
-  // ==========================================================
+  // ===================================================
 
-  if (
-    sale?.installment_months
-  ) {
-    receipt +=
-      `Term: ${sale.installment_months} months\n`
+  if (sale.installment) {
+    receipt += line("-", WIDTH) + "\n"
+
+    receipt += "INSTALLMENT\n"
+
+    if (sale.installment.term) {
+      receipt += `Term: ${sale.installment.term} months\n`
+    }
+
+    if (sale.installment.down_payment) {
+      receipt +=
+        `Down Payment: ${money(
+          sale.installment.down_payment
+        )}\n`
+    }
+
+    if (sale.installment.installment_amount) {
+      receipt +=
+        `Monthly: ${money(
+          sale.installment.installment_amount
+        )}\n`
+    }
   }
 
-  // ==========================================================
+  // ===================================================
   // FOOTER
-  // ==========================================================
+  // ===================================================
 
-  receipt +=
-    "\n"
+  receipt += "\n"
 
-  receipt +=
-    center
+  receipt += "\x1B\x61\x01"
 
-  receipt +=
-    boldOn
+  receipt += "Thank you for your purchase!\n"
+  receipt += "Please keep this receipt.\n"
 
-  receipt +=
-    "Thank you for your purchase!\n"
+  receipt += "\x1B\x61\x00"
 
-  receipt +=
-    boldOff
+  receipt += "\n\n\n"
 
-  receipt +=
-    "Please come again.\n"
-
-  receipt +=
-    "\n\n\n"
-
-  // ==========================================================
-  // CUT
-  // ==========================================================
-
-  receipt +=
-    GS +
-    "V" +
-    "\x00"
+  // ESC/POS CUT
+  receipt += "\x1D\x56\x00"
 
   return receipt
 }
 
+// =====================================================
+// PRINT JOB
+// =====================================================
 
-// ============================================================
-// HEALTH CHECK
-// ============================================================
+async function processPrintJob(job) {
+  if (!job || !job.sale) {
+    throw new Error("Invalid print job.")
+  }
 
-app.get(
-  "/",
-  (req, res) => {
-    res.json({
+  let printerName = job.printer_name
+
+  // If no printer specified, use Windows default printer
+  if (!printerName) {
+    const printer = await getDefaultPrinter()
+
+    if (!printer) {
+      throw new Error(
+        "No default Windows printer found."
+      )
+    }
+
+    printerName = printer.Name
+
+    if (printer.WorkOffline === true) {
+      throw new Error(
+        `Printer "${printer.Name}" is offline.`
+      )
+    }
+  }
+
+  console.log(
+    `Printing job ${job.id} using "${printerName}"`
+  )
+
+  const receipt = createSaleReceipt(job.sale)
+
+  await rawPrint(
+    printerName,
+    receipt
+  )
+
+  return {
+    printerName,
+  }
+}
+
+// =====================================================
+// LOCAL HEALTH
+// =====================================================
+
+app.get("/", async (req, res) => {
+  let printer = null
+  let printerError = null
+
+  try {
+    printer = await getDefaultPrinter()
+  } catch (error) {
+    printerError = error.message
+  }
+
+  res.json({
+    success: true,
+    service: "ELKJ Windows Print Agent",
+    status: "online",
+    render_api: RENDER_API,
+    printer,
+    printer_error: printerError,
+    time: new Date().toISOString(),
+  })
+})
+
+// =====================================================
+// PRINTER INFO
+// =====================================================
+
+app.get("/printer", async (req, res) => {
+  try {
+    const printer = await getDefaultPrinter()
+
+    if (!printer) {
+      return res.status(404).json({
+        success: false,
+        message: "No default printer found.",
+      })
+    }
+
+    return res.json({
       success: true,
-      service:
-        "ELKJ POS Print Service",
-      status:
-        "online",
+      printer,
+    })
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
     })
   }
-)
+})
 
+// =====================================================
+// LOCAL PRINT TEST
+// =====================================================
 
-// ============================================================
-// GET PRINTER
-// ============================================================
+app.post("/print-test", async (req, res) => {
+  try {
+    const printer = await getDefaultPrinter()
 
-app.get(
-  "/printer",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const printer =
-        await getDefaultPrinter()
-
-      if (!printer) {
-        return res
-          .status(404)
-          .json({
-            success: false,
-            message:
-              "No default printer found.",
-          })
-      }
-
-      return res.json({
-        success: true,
-        printer,
+    if (!printer) {
+      return res.status(404).json({
+        success: false,
+        message: "No default printer found.",
       })
-    } catch (error) {
-      console.error(
-        error
-      )
-
-      return res
-        .status(500)
-        .json({
-          success: false,
-          message:
-            "Unable to detect default printer.",
-          error:
-            error.message,
-        })
     }
-  }
-)
 
-
-// ============================================================
-// TEST PRINT
-// ============================================================
-
-app.post(
-  "/print-test",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const printer =
-        await getDefaultPrinter()
-
-      if (!printer) {
-        return res
-          .status(404)
-          .json({
-            success: false,
-            message:
-              "No default printer found.",
-          })
-      }
-
-      if (
-        printer.WorkOffline ===
-        true
-      ) {
-        return res
-          .status(409)
-          .json({
-            success: false,
-            message:
-              `Printer "${printer.Name}" is offline.`,
-          })
-      }
-
-      const testSale = {
-        invoice:
-          "TEST-000001",
-
-        customer_name:
-          "Test Customer",
-
-        created_at:
-          new Date().toISOString(),
-
-        subtotal:
-          250,
-
-        discount:
-          0,
-
-        tax:
-          0,
-
-        total_amount:
-          250,
-
-        payment_method:
-          "Cash",
-
-        amount_paid:
-          300,
-
-        change_amount:
-          50,
-
-        sale_items: [
-          {
-            product_name:
-              "Sample Product",
-
-            quantity:
-              2,
-
-            unit_price:
-              100,
-          },
-
-          {
-            product_name:
-              "Test Item",
-
-            quantity:
-              1,
-
-            unit_price:
-              50,
-          },
-        ],
-      }
-
-      const receipt =
-        createSaleReceipt(
-          testSale
-        )
-
-      await rawPrint(
-        printer.Name,
-        receipt
-      )
-
-      return res.json({
-        success: true,
-        message:
-          "Test receipt sent successfully.",
-        printer:
-          printer.Name,
+    if (printer.WorkOffline === true) {
+      return res.status(400).json({
+        success: false,
+        message: `Printer "${printer.Name}" is offline.`,
       })
-    } catch (error) {
-      console.error(
-        "Test print error:",
-        error
-      )
-
-      return res
-        .status(500)
-        .json({
-          success: false,
-          message:
-            "Failed to send RAW test print.",
-          error:
-            error.message,
-        })
     }
+
+    const testReceipt = [
+      "\x1B\x40",
+      "\x1B\x61\x01",
+      "\x1B\x45\x01",
+      "ELKJ IT SOLUTIONS\n",
+      "\x1B\x45\x00",
+      "PRINT TEST\n",
+      "\x1B\x61\x00",
+      "--------------------------------\n",
+      "Printer is working.\n",
+      `Printer: ${printer.Name}\n`,
+      `Date: ${new Date().toLocaleString("en-PH")}\n`,
+      "--------------------------------\n",
+      "\n\n\n",
+      "\x1D\x56\x00",
+    ].join("")
+
+    await rawPrint(
+      printer.Name,
+      testReceipt
+    )
+
+    res.json({
+      success: true,
+      message: "Test receipt printed.",
+      printer: printer.Name,
+    })
+  } catch (error) {
+    console.error("Print test error:", error)
+
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    })
   }
-)
+})
 
+// =====================================================
+// MANUAL LOCAL PRINT
+// =====================================================
 
-// ============================================================
-// PRINT ACTUAL SALE RECEIPT
-// ============================================================
+app.post("/print-receipt", async (req, res) => {
+  try {
+    const { sale, printer_name } = req.body
 
-app.post(
-  "/print-receipt",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const sale =
-        req.body?.sale
-
-      // --------------------------------------------------------
-      // CHECK SALE
-      // --------------------------------------------------------
-
-      if (!sale) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message:
-              "Sale data is required.",
-          })
-      }
-
-      // --------------------------------------------------------
-      // GET PRINTER
-      // --------------------------------------------------------
-
-      const printer =
-        await getDefaultPrinter()
-
-      if (!printer) {
-        return res
-          .status(404)
-          .json({
-            success: false,
-            message:
-              "No default printer found.",
-          })
-      }
-
-      // --------------------------------------------------------
-      // CHECK OFFLINE
-      // --------------------------------------------------------
-
-      if (
-        printer.WorkOffline ===
-        true
-      ) {
-        return res
-          .status(409)
-          .json({
-            success: false,
-            message:
-              `Printer "${printer.Name}" is offline.`,
-          })
-      }
-
-      // --------------------------------------------------------
-      // LOG
-      // --------------------------------------------------------
-
-      console.log("")
-      console.log(
-        "======================================"
-      )
-      console.log(
-        "PRINT POS RECEIPT"
-      )
-      console.log(
-        "======================================"
-      )
-
-      console.log(
-        "Printer:",
-        printer.Name
-      )
-
-      console.log(
-        "Invoice:",
-        sale?.invoice ??
-          sale?.invoice_number ??
-          "-"
-      )
-
-      console.log(
-        "Customer:",
-        sale?.customer_name ??
-          "Walk-in Customer"
-      )
-
-      console.log(
-        "Payment:",
-        sale?.payment_method ??
-          "Cash"
-      )
-
-      console.log(
-        "Total:",
-        sale?.total_amount ??
-          sale?.total ??
-          0
-      )
-
-      console.log(
-        "Items:",
-        Array.isArray(
-          sale?.sale_items
-        )
-          ? sale.sale_items.length
-          : 0
-      )
-
-      console.log(
-        "======================================"
-      )
-
-      // --------------------------------------------------------
-      // CREATE RECEIPT
-      // --------------------------------------------------------
-
-      const receipt =
-        createSaleReceipt(
-          sale
-        )
-
-      // --------------------------------------------------------
-      // PRINT
-      // --------------------------------------------------------
-
-      await rawPrint(
-        printer.Name,
-        receipt
-      )
-
-      console.log(
-        "Receipt printed successfully."
-      )
-
-      return res.json({
-        success: true,
-        message:
-          "Receipt printed successfully.",
-        printer:
-          printer.Name,
+    if (!sale) {
+      return res.status(422).json({
+        success: false,
+        message: "sale is required.",
       })
-    } catch (error) {
-      console.error("")
-      console.error(
-        "======================================"
-      )
-      console.error(
-        "RECEIPT PRINT FAILED"
-      )
-      console.error(
-        "======================================"
-      )
-      console.error(
-        error
-      )
-      console.error(
-        "======================================"
+    }
+
+    const job = {
+      id: "local",
+      printer_name:
+        printer_name || null,
+      sale,
+    }
+
+    const result =
+      await processPrintJob(job)
+
+    return res.json({
+      success: true,
+      message: "Receipt printed.",
+      printer: result.printerName,
+    })
+  } catch (error) {
+    console.error(
+      "Local receipt error:",
+      error
+    )
+
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    })
+  }
+})
+
+// =====================================================
+// RENDER API REQUEST HELPER
+// =====================================================
+
+async function renderRequest(
+  endpoint,
+  options = {}
+) {
+  const response = await fetch(
+    `${RENDER_API}${endpoint}`,
+    {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Print-Api-Key": PRINT_API_KEY,
+        ...(options.headers || {}),
+      },
+    }
+  )
+
+  const text = await response.text()
+
+  let data
+
+  try {
+    data = JSON.parse(text)
+  } catch {
+    throw new Error(
+      `Render returned invalid JSON: ${text}`
+    )
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      data.message ||
+        `Render request failed: ${response.status}`
+    )
+  }
+
+  return data
+}
+
+// =====================================================
+// POLL RENDER FOR PRINT JOB
+// =====================================================
+
+let isProcessing = false
+
+async function pollPrintJobs() {
+  if (isProcessing) {
+    return
+  }
+
+  isProcessing = true
+
+  try {
+    const result =
+      await renderRequest(
+        "/print-job/next"
       )
 
-      return res
-        .status(500)
-        .json({
-          success: false,
-          message:
-            "Failed to print receipt.",
-          error:
-            error.message,
-        })
+    const job = result.job
+
+    if (!job) {
+      return
     }
+
+    console.log(
+      `Received print job: ${job.id}`
+    )
+
+    try {
+      const printResult =
+        await processPrintJob(job)
+
+      await renderRequest(
+        `/print-job/${job.id}/complete`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            printer: printResult.printerName,
+          }),
+        }
+      )
+
+      console.log(
+        `Print job completed: ${job.id}`
+      )
+    } catch (printError) {
+      console.error(
+        `Print failed: ${job.id}`,
+        printError
+      )
+
+      await renderRequest(
+        `/print-job/${job.id}/fail`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            error: printError.message,
+          }),
+        }
+      )
+    }
+  } catch (error) {
+    console.error(
+      "Polling error:",
+      error.message
+    )
+  } finally {
+    isProcessing = false
   }
+}
+
+// =====================================================
+// START POLLING
+// =====================================================
+
+setInterval(
+  pollPrintJobs,
+  POLL_INTERVAL
 )
 
+// Run immediately
+pollPrintJobs()
 
-// ============================================================
-// START SERVER
-// ============================================================
+// =====================================================
+// START LOCAL SERVER
+// =====================================================
 
 app.listen(
   PORT,
   HOST,
   () => {
-    console.log("")
     console.log(
-      "======================================"
+      "=========================================="
     )
+
     console.log(
-      "       ELKJ POS PRINT SERVICE"
+      "ELKJ WINDOWS PRINT AGENT"
     )
+
     console.log(
-      "======================================"
+      "=========================================="
     )
+
     console.log(
-      `Service: http://${HOST}:${PORT}`
+      `Local URL: http://${HOST}:${PORT}`
     )
+
     console.log(
-      `Printer: http://${HOST}:${PORT}/printer`
+      `Render API: ${RENDER_API}`
     )
+
     console.log(
-      `Test:    POST http://${HOST}:${PORT}/print-test`
+      `Polling every ${POLL_INTERVAL}ms`
     )
+
     console.log(
-      `Receipt: POST http://${HOST}:${PORT}/print-receipt`
+      "=========================================="
     )
-    console.log(
-      "======================================"
-    )
-    console.log("")
   }
 )
