@@ -5,7 +5,7 @@ const { execFile } = require("child_process")
 const app = express()
 
 const PORT = 9100
-const HOST = "127.0.0.1"
+const HOST = "https://printing-service-a55f.onrender.com"
 
 app.use(cors())
 
